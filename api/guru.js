@@ -257,8 +257,8 @@ export default async function handler(req, res) {
         ...(DEAL_FIELD_SUBSCRIPTION && subscriptionCode ? { [DEAL_FIELD_SUBSCRIPTION]: subscriptionCode } : {}),
         ...extraFields
       };
-      await pdr(`/api/v1/deals/${dealId}`, {
-        method: "PATCH",
+    await pdr(`/api/v1/deals/${dealId}`, {
+        method: "PUT",
         headers: { "Content-Type":"application/json" },
         body: JSON.stringify(payload)
       });
