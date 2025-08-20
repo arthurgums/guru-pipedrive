@@ -1,0 +1,150 @@
+// api/guru.js
+// Vercel Node.js Function — recebe webhook da Guru e upserta no Pipedrive
+
+// As variáveis vêm do painel da Vercel (Project → Settings → Environment Variables)
+const {
+  PIPEDRIVE_DOMAIN,        // ex: "minhaempresa"
+  PIPEDRIVE_TOKEN,         // token da API
+  PIPELINE_ID,             // id do pipeline
+  STAGE_ID_ONBOARD,        // id estágio "Onboarding"
+  STAGE_ID_PEND,           // id estágio "Pagamento pendente"
+  STAGE_ID_CHURN,          // id estágio "Churn"
+  PERSON_OWNER_ID,         // opcional (id do dono da pessoa)
+  DEAL_OWNER_ID,           // opcional (id do dono do deal)
+  DEAL_FIELD_SUBSCRIPTION, // hash do campo custom de Deal p/ subscription_code
+  GURU_API_TOKEN           // token esperado no payload (validação simples)
+} = process.env;
+
+// Helper p/ Pipedrive
+async function pdr(path, opts = {}) {
+  const url = `https://${PIPEDRIVE_DOMAIN}.pipedrive.com${path}${path.includes("?") ? "&" : "?"}api_token=${PIPEDRIVE_TOKEN}`;
+  const res = await fetch(url, opts);
+  const json = await res.json().catch(() => ({}));
+  if (!res.ok || json.success === false) {
+    throw new Error(`Pipedrive error: ${res.status} ${res.statusText} ${JSON.stringify(json)}`);
+  }
+  return json;
+}
+
+// Decide estágio pelo status de assinatura/fatura
+function resolveStage({ lastStatus, invoiceStatus }) {
+  if (lastStatus === "cancelled") return Number(STAGE_ID_CHURN);
+  if (["unpaid","overdue","pending"].includes((invoiceStatus || "").toLowerCase())) {
+    return Number(STAGE_ID_PEND);
+  }
+  return Number(STAGE_ID_ONBOARD);
+}
+
+export default async function handler(req, res) {
+  try {
+    if (req.method !== "POST") return res.status(405).send("Method Not Allowed");
+
+    // Vercel parseia JSON automaticamente quando Content-Type=application/json
+    const body = req.body || {};
+    if (!body || typeof body !== "object") return res.status(400).json({ ok: false, error: "Invalid JSON" });
+
+    // Validação simples do webhook (opcional, mas recomendado)
+    if (GURU_API_TOKEN && body.api_token && body.api_token !== GURU_API_TOKEN) {
+      return res.status(401).json({ ok: false, error: "invalid token" });
+    }
+
+    // Só processa eventos de assinatura (ajuste se quiser tratar outros)
+    if (body.webhook_type && body.webhook_type !== "subscription") {
+      return res.status(204).end();
+    }
+
+    // ===== Map do payload (ajuste conforme seu webhook da Guru) =====
+    const sub = body;
+    const contact    = sub.last_transaction?.contact || {};
+    const subscriber = sub.subscriber || {};
+    const email = (subscriber.email || contact.email || "").trim();
+    const name  = (subscriber.name  || contact.name  || "Assinante (sem nome)").trim();
+    const phone = (subscriber.phone_number || contact.phone_number || "").trim();
+    const cpf   = (subscriber.doc || contact.doc || "").trim();
+
+    const subscriptionCode = sub.subscription_code || sub.id || "";
+    const planName   = sub.product?.name || sub.next_product?.name || "Plano";
+    const mrr        = Number(sub.current_invoice?.value || sub.last_transaction?.invoice?.value || 0);
+    const invoiceSt  = sub.current_invoice?.status || "";
+    const lastStatus = sub.last_status || "unknown";
+    const nextCharge = sub.dates?.next_cycle_at || sub.current_invoice?.charge_at || null;
+
+    // ===== Upsert PERSON =====
+    let personId = null;
+    if (email) {
+      const search = await pdr(`/api/v2/persons/search?term=${encodeURIComponent(email)}&fields=email&exact_match=1`, { method: "GET" });
+      personId = search?.data?.items?.[0]?.item?.id || null; // v2 search persons
+    }
+    if (!personId) {
+      const created = await pdr(`/api/v1/persons`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          name,
+          owner_id: PERSON_OWNER_ID ? Number(PERSON_OWNER_ID) : undefined,
+          visible_to: 3,
+          email: email ? [{ value: email, primary: true }] : undefined,
+          phone: phone ? [{ value: phone, primary: true }] : undefined,
+          // Se já tiver um campo custom p/ CPF na pessoa, adicionar aqui: "hash_cpf": cpf || undefined
+        })
+      });
+      personId = created?.data?.id;
+      if (!personId) throw new Error("Falha ao criar pessoa");
+    }
+
+    // ===== Idempotência por subscription_code no DEAL =====
+    let dealId = null;
+    if (DEAL_FIELD_SUBSCRIPTION && subscriptionCode) {
+      const dsearch = await pdr(`/api/v2/deals/search?term=${encodeURIComponent(subscriptionCode)}&fields=custom_fields&exact_match=1`, { method: "GET" });
+      dealId = dsearch?.data?.items?.[0]?.item?.id || null;
+    }
+
+    const desiredStage = resolveStage({ lastStatus, invoiceStatus: invoiceSt });
+
+    if (!dealId) {
+      const createdDeal = await pdr(`/api/v2/deals`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          title: `${planName} – ${name}`,
+          person_id: personId,
+          pipeline_id: Number(PIPELINE_ID),
+          stage_id: desiredStage,
+          value: mrr,
+          currency: "BRL",
+          owner_id: DEAL_OWNER_ID ? Number(DEAL_OWNER_ID) : undefined,
+          status: "open",
+          ...(DEAL_FIELD_SUBSCRIPTION && subscriptionCode ? { [DEAL_FIELD_SUBSCRIPTION]: subscriptionCode } : {}),
+          // Campos custom adicionais de deal (se criados):
+          // "hash_status_assinatura": lastStatus,
+          // "hash_proxima_cobranca": nextCharge,
+          // "hash_plano": planName,
+          // "hash_cpf": cpf
+        })
+      });
+      dealId = createdDeal?.data?.id || null;
+    } else {
+      await pdr(`/api/v2/deals/${dealId}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          stage_id: desiredStage,
+          value: mrr,
+          ...(DEAL_FIELD_SUBSCRIPTION && subscriptionCode ? { [DEAL_FIELD_SUBSCRIPTION]: subscriptionCode } : {}),
+        })
+      });
+    }
+
+    return res.status(200).json({
+      ok: true,
+      personId,
+      dealId,
+      status: lastStatus,
+      invoiceStatus: invoiceSt,
+      nextCharge
+    });
+  } catch (e) {
+    console.error(e);
+    return res.status(500).json({ ok: false, error: e.message });
+  }
+}

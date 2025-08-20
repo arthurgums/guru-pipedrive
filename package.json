@@ -1,0 +1,13 @@
+{
+  "name": "guru-pipedrive-webhook",
+  "version": "1.0.0",
+  "type": "module",
+  "private": true,
+  "license": "UNLICENSED",
+  "engines": { "node": ">=20" },
+  "dependencies": {},
+  "scripts": {
+    "dev": "vercel dev",
+    "start": "node api/guru.js"
+  }
+}
