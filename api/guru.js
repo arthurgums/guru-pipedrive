@@ -14,19 +14,12 @@
 // DEAL_FIELD_ID_ORIGEM             (ex.: subscription_code)
 // DEAL_FIELD_CANAL_ORIGEM          (ex.: "Assinatura")
 // DEAL_FIELD_ID_CANAL_ORIGEM       (ex.: "guru_subscription")
-// DEAL_FIELD_CPF
-// DEAL_FIELD_WHATSAPP
-// DEAL_FIELD_TELEFONE
-// DEAL_FIELD_LINK_RASTREIO
-// DEAL_FIELD_LINK                  (ex.: sub.public_url)
-// ---- UTM da última transação ----
+// DEAL_FIELD_CPF, DEAL_FIELD_WHATSAPP, DEAL_FIELD_TELEFONE
+// DEAL_FIELD_LINK_RASTREIO, DEAL_FIELD_LINK
 // DEAL_FIELD_UTM_SOURCE, DEAL_FIELD_UTM_MEDIUM, DEAL_FIELD_UTM_CAMPAIGN, DEAL_FIELD_UTM_CONTENT, DEAL_FIELD_UTM_TERM
-// ---- Fatura/método de pagamento ---
 // DEAL_FIELD_INVOICE_STATUS, DEAL_FIELD_INVOICE_CODE, DEAL_FIELD_INVOICE_URL, DEAL_FIELD_PAYMENT_METHOD
-// ---- Datas de ciclo / trial -------
 // DEAL_FIELD_CYCLE_START_DATE, DEAL_FIELD_CYCLE_END_DATE, DEAL_FIELD_NEXT_CYCLE_DATE
 // DEAL_FIELD_TRIAL_START_DATE, DEAL_FIELD_TRIAL_END_DATE
-// ---- Cartão (se quiser registrar) -
 // DEAL_FIELD_CARD_BRAND, DEAL_FIELD_CARD_LAST4
 
 const {
@@ -82,13 +75,27 @@ function resolveStage({ lastStatus, invoiceStatus }) {
 const ALLOW_CREATE = (process.env.ALLOW_CREATE_STATUSES || "ativa,iniciada,trial,active,started,trialing")
   .split(",").map(s => norm(s.trim()));
 
+// ---- leitura robusta do corpo (evita "Invalid JSON") ----
+async function readRaw(req) {
+  const chunks = [];
+  for await (const c of req) chunks.push(typeof c === "string" ? Buffer.from(c) : c);
+  return Buffer.concat(chunks).toString("utf8");
+}
+async function readJsonFromReq(req) {
+  if (req.body && typeof req.body === "object") return req.body;        // já veio parseado
+  if (typeof req.body === "string") return JSON.parse(req.body);        // string JSON
+  const raw = (await readRaw(req)).trim();                               // stream cru
+  return raw ? JSON.parse(raw) : {};
+}
+
 // ---------------- handler ----------------
 export default async function handler(req, res) {
   try {
     if (req.method !== "POST") return res.status(405).send("Method Not Allowed");
 
-    const body = typeof req.body === "string" ? JSON.parse(req.body) : (req.body || {});
-    if (!body || typeof body !== "object") return res.status(400).json({ ok:false, error:"Invalid JSON" });
+    let body = {};
+    try { body = await readJsonFromReq(req); }
+    catch { return res.status(400).json({ ok:false, error:"Invalid JSON body" }); }
 
     // Secret (body.api_token, ?secret=, header x-webhook-secret)
     const providedSecret = body.api_token || (req.query && req.query.secret) || req.headers["x-webhook-secret"];
