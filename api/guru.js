@@ -146,7 +146,7 @@ export default async function handler(req, res) {
     // ---------- upsert Person ----------
     let personId = null;
     if (email) {
-      const search = await pdr(`/api/v1/persons/search?term=${encodeURIComponent(email)}&fields=email&exact_match=1`, { method:"GET" });
+      const search = await pdr(`/api/v2/persons/search?term=${encodeURIComponent(email)}&fields=email&exact_match=1`, { method:"GET" });
       personId = search?.data?.items?.[0]?.item?.id || null;
     }
     if (!personId) {
@@ -169,7 +169,7 @@ export default async function handler(req, res) {
     // ---------- idempotência por subscription_code ----------
     let dealId = null;
     if (DEAL_FIELD_SUBSCRIPTION && subscriptionCode) {
-      const dsearch = await pdr(`/api/v1/deals/search?term=${encodeURIComponent(subscriptionCode)}&fields=custom_fields&exact_match=1`, { method:"GET" });
+      const dsearch = await pdr(`/api/v2/deals/search?term=${encodeURIComponent(subscriptionCode)}&fields=custom_fields&exact_match=1`, { method:"GET" });
       dealId = dsearch?.data?.items?.[0]?.item?.id || null;
     }
 
