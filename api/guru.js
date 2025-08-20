@@ -29,17 +29,31 @@ function numOrNull(v){
   return (v!==undefined && v!==null && v!=="" && !Number.isNaN(Number(v))) ? Number(v) : null;
 }
 
+function norm(s){ return (s || "").normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase(); }
+
 function resolveStage({ lastStatus, invoiceStatus }) {
   const onboard = numOrNull(STAGE_ID_ONBOARD);
   const churn   = numOrNull(STAGE_ID_CHURN);
   const pend    = numOrNull(STAGE_ID_PEND); // pode ser null
 
-  if (lastStatus === "cancelled") return churn ?? onboard;
-  if (["unpaid","overdue","pending"].includes((invoiceStatus || "").toLowerCase())) {
-    return pend ?? onboard; // fallback para Onboarding se não existir PEND
-  }
+  const ls = norm(lastStatus);
+  const isCancelled = ["cancelled","canceled","cancelada","cancelado"].includes(ls);
+  if (isCancelled) return churn ?? onboard;
+
+  const inv = norm(invoiceStatus);
+  const isPend = ["unpaid","overdue","pending","atrasada","pendente"].includes(inv);
+  if (isPend) return pend ?? onboard;
+
   return onboard;
 }
+
+
+// status permitidos para CRIAÇÃO de deal (minúsculos, separados por vírgula)
+// você pode trocar via env var ALLOW_CREATE_STATUSES se quiser
+const ALLOW_CREATE = (process.env.ALLOW_CREATE_STATUSES || "ativa,iniciada,trial,active,started,trialing")
+  .split(",").map(s => s.trim()).map(s => s.normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase());
+
+
 
 // ---- Handler ---------------------------------------------------------------
 export default async function handler(req, res) {
@@ -107,6 +121,20 @@ export default async function handler(req, res) {
       const dsearch = await pdr(`/api/v2/deals/search?term=${encodeURIComponent(subscriptionCode)}&fields=custom_fields&exact_match=1`, { method: "GET" });
       dealId = dsearch?.data?.items?.[0]?.item?.id || null;
     }
+
+    const ls = (lastStatus || "").toLowerCase();
+const canCreate = ALLOW_CREATE.includes(ls);
+
+// Se não existir deal e o status não for de criação → ignora (não cria)
+if (!dealId && !canCreate) {
+  return res.status(200).json({
+    ok: true,
+    skipped: true,
+    reason: "creation-not-allowed-for-status",
+    lastStatus
+  });
+}
+
 
     const desiredStage = resolveStage({ lastStatus, invoiceStatus: invoiceSt });
 
