@@ -17,16 +17,17 @@ const {
   KLAVIYO_LIST_ID
 } = process.env;
 
-// Aceita KLAVIYO_PRIVATE_KEY ou KLAVIYO_API_KEY (pra não quebrar quem já setou)
+// Aceita KLAVIYO_PRIVATE_KEY ou KLAVIYO_API_KEY para a mesma finalidade
 const KLAVIYO_PRIVATE_KEY = process.env.KLAVIYO_PRIVATE_KEY || process.env.KLAVIYO_API_KEY;
+const KLAVIYO_REVISION = process.env.KLAVIYO_REVISION || "2025-07-15";
 
-// ---------- helpers comuns ----------
+// ----------------- helpers comuns -----------------
 async function pdr(path, opts = {}) {
   const url = `https://${PIPEDRIVE_DOMAIN}.pipedrive.com${path}${path.includes("?") ? "&" : "?"}api_token=${PIPEDRIVE_TOKEN}`;
   const res = await fetch(url, opts);
   const text = await res.text();
   let json = {};
-  try { json = JSON.parse(text); } catch (_) {}
+  try { json = JSON.parse(text); } catch { json = {}; }
   if (!res.ok || json.success === false) {
     throw new Error(`Pipedrive error: ${res.status} ${res.statusText} ${text}`);
   }
@@ -58,7 +59,7 @@ function ymdUTC(d) {
 const ALLOW_CREATE = (process.env.ALLOW_CREATE_STATUSES || "ativa,iniciada,trial,active,started,trialing")
   .split(",").map(s => norm(s.trim()));
 
-// ---------- KLAVIYO (JSON:API, v2025-07-15) ----------
+// ----------------- KLAVIYO (JSON:API) -----------------
 function hasKlaviyoEnv() {
   return Boolean(KLAVIYO_PRIVATE_KEY && KLAVIYO_LIST_ID);
 }
@@ -69,13 +70,13 @@ async function klFetch(url, payload) {
       "Authorization": `Klaviyo-API-Key ${KLAVIYO_PRIVATE_KEY}`,
       "Content-Type": "application/json",
       "Accept": "application/json",
-      "revision": "2025-07-15"
+      "revision": KLAVIYO_REVISION
     },
     body: JSON.stringify(payload)
   });
   const text = await r.text();
   let body = {};
-  try { body = JSON.parse(text); } catch (_) { body = { raw: text }; }
+  try { body = JSON.parse(text); } catch { body = { raw: text }; }
   return { ok: r.ok, status: r.status, body };
 }
 
@@ -110,15 +111,26 @@ async function klaviyoSubscribe({ email, phone }) {
   return klFetch("https://a.klaviyo.com/api/profile-subscription-bulk-create-jobs/", payload);
 }
 
-// Cancela assinatura de email na lista
+// Cancela assinatura de email na lista (sem tocar no Pipedrive)
 async function klaviyoUnsubscribe({ email }) {
   if (!hasKlaviyoEnv() || !email) return { skipped: true };
   const payload = {
     data: {
       type: "profile-subscription-bulk-delete-job",
       attributes: {
-        emails: [email]
-        // Para SMS: phone_numbers: ["+5511999999999"]
+        profiles: {
+          data: [
+            {
+              type: "profile",
+              attributes: {
+                email,
+                subscriptions: {
+                  email: { marketing: { consent: "UNSUBSCRIBED" } }
+                }
+              }
+            }
+          ]
+        }
       },
       relationships: {
         list: { data: { type: "list", id: KLAVIYO_LIST_ID } }
@@ -128,7 +140,7 @@ async function klaviyoUnsubscribe({ email }) {
   return klFetch("https://a.klaviyo.com/api/profile-subscription-bulk-delete-jobs/", payload);
 }
 
-// ---------- handler ----------
+// ----------------- handler -----------------
 export default async function handler(req, res) {
   try {
     if (req.method !== "POST") return res.status(405).send("Method Not Allowed");
@@ -149,7 +161,6 @@ export default async function handler(req, res) {
     // ----- map mínimo do payload -----
     const contact    = sub.last_transaction?.contact || {};
     const subscriber = sub.subscriber || {};
-
     const email = (subscriber.email || contact.email || "").trim();
     const fullName = (subscriber.name || contact.name || "Assinante (sem nome)").trim();
     const phone = (subscriber.phone_number || contact.phone_number || "").trim();
@@ -171,7 +182,7 @@ export default async function handler(req, res) {
       ? String(expectedCloseRaw).trim()
       : ymdUTC(addDaysUTC(new Date(), 30));
 
-    // —— Cancelamento: apenas remove do Klaviyo e sai (não mexe no Pipedrive)
+    // —— Cancelamento: remove do Klaviyo e sai (não mexe no Pipedrive)
     if (["cancelada","cancelado","cancelled","canceled"].includes(ls)) {
       const kl = await klaviyoUnsubscribe({ email });
       return res.status(200).json({ ok: true, skipped: true, reason: "cancel-received", klaviyo: kl });
