@@ -61,35 +61,11 @@ async function pdCall(path, opts = {}) {
   return { diag, data: r.data };
 }
 
-// Klaviyo helpers com diagnóstico e fallback
-async function klaviyoSubscribe({ email, phone, firstName, lastName, listId }) {
-  if (!KLAVIYO_API_KEY || !listId || !email) return { ok:false, skipped:true, reason:"missing_key_list_or_email" };
+async function klaviyoSubscribe({ email, phone, listId }) {
+  if (!KLAVIYO_API_KEY || !listId || !email) return { skipped: true };
 
-  // T1: endpoint simples (v2)
-  try {
-    const res = await fetch(`${KLAVIYO_BASE}/api/v2/list/${listId}/subscribe`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        api_key: KLAVIYO_API_KEY,
-        profiles: [{
-          email,
-          phone_number: phone || undefined,
-          properties: { $first_name: firstName || undefined, $last_name: lastName || undefined, source: "guru" }
-        }]
-      })
-    });
-    const txt = await res.text();
-    const body = safeJson(txt);
-    const diag = { ok: res.ok, method: "v2/subscribe", status: res.status, body };
-    console.log("[Klaviyo SUB v2]", res.status, body && typeof body === "string" ? trimText(body) : "");
-    if (res.ok) return diag;
-  } catch (e) {
-    console.error("[Klaviyo SUB v2 error]", e.message);
-  }
-
-  // T2: moderno (bulk-create)
-  const res2 = await fetch(`${KLAVIYO_BASE}/api/profile-subscription-bulk-create-jobs/`, {
+  // 1) Moderno (recomendado)
+  const modern = await fetch(`https://a.klaviyo.com/api/profile-subscription-bulk-create-jobs/`, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
@@ -97,14 +73,45 @@ async function klaviyoSubscribe({ email, phone, firstName, lastName, listId }) {
       "revision": "2025-07-15"
     },
     body: JSON.stringify({
-      data: { type: "profile-subscription-bulk-create-job", attributes: { list_id: listId, profiles: [{ email, phone_number: phone || undefined }] } }
+      data: {
+        type: "profile-subscription-bulk-create-job",
+        attributes: {
+          list_id: listId,
+          profiles: {
+            data: [
+              {
+                type: "profile",
+                attributes: {
+                  email,
+                  ...(phone ? { phone_number: phone } : {})
+                  // Se quiser, pode adicionar: properties: { source: "guru" }
+                }
+              }
+            ]
+          }
+        }
+      }
     })
   });
-  const txt2 = await res2.text();
-  const body2 = safeJson(txt2);
-  const diag2 = { ok: res2.ok, method: "bulk-create", status: res2.status, body: body2 };
-  console.log("[Klaviyo SUB bulk]", res2.status, typeof body2 === "string" ? trimText(body2) : "");
-  return diag2;
+  if (modern.ok) {
+    return { ok: true, method: "bulk-create", status: modern.status };
+  }
+  const modernText = await modern.text();
+
+  // 2) Legacy (v2) como fallback
+  const legacy = await fetch(`https://a.klaviyo.com/api/v2/list/${listId}/subscribe`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      api_key: KLAVIYO_API_KEY,
+      profiles: [{ email, ...(phone ? { phone_number: phone } : {}) }]
+    })
+  });
+  if (legacy.ok) {
+    return { ok: true, method: "v2", status: legacy.status };
+  }
+  const legacyText = await legacy.text();
+  throw new Error(`Klaviyo subscribe failed. modern=${modern.status} ${modernText} | legacy=${legacy.status} ${legacyText}`);
 }
 
 async function klaviyoUnsubscribe({ email, listId }) {
