@@ -4,6 +4,7 @@
 // - Idempotência por subscription_code (se já existir, não cria de novo)
 // - expected_close_date = period_end | hoje+30
 // - Klaviyo: subscribe em “novos”, unsubscribe em cancelamento (Pipedrive permanece igual)
+// - Normalização de telefone para E.164 (se inválido, omite do payload do Klaviyo)
 
 const {
   PIPEDRIVE_DOMAIN,
@@ -34,7 +35,8 @@ async function pdr(path, opts = {}) {
   return { status: res.status, json };
 }
 const norm = s => (s || "").normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase();
-const normPhone = p => (p || "").replace(/\D+/g, "");
+const normPhoneDigits = p => (p || "").replace(/\D+/g, "");
+
 async function readRaw(req) {
   const chunks = [];
   for await (const c of req) chunks.push(typeof c === "string" ? Buffer.from(c) : c);
@@ -53,6 +55,21 @@ function addDaysUTC(date, days) {
 }
 function ymdUTC(d) {
   return d.toISOString().slice(0, 10); // "YYYY-MM-DD"
+}
+
+// Normaliza telefone para E.164. Se inválido → retorna null (para omitir no Klaviyo)
+function toE164(phone, countryCode = "55") {
+  const digits = normPhoneDigits(phone);
+  if (!digits) return null;
+
+  // Se 'digits' já começar com o DDI (ex.: "55..."), mantém; senão prefixa
+  const cc = String(countryCode || "").replace(/\D+/g, "") || "55";
+  const needsCC = !digits.startsWith(cc);
+  const full = (needsCC ? cc : "") + digits;
+
+  const e164 = `+${full}`;
+  // Validação básica E.164: + e 8–15 dígitos
+  return /^\+[1-9]\d{7,14}$/.test(e164) ? e164 : null;
 }
 
 // Status que PODEM criar deal (pt/en)
@@ -161,9 +178,14 @@ export default async function handler(req, res) {
     // ----- map mínimo do payload -----
     const contact    = sub.last_transaction?.contact || {};
     const subscriber = sub.subscriber || {};
+
     const email = (subscriber.email || contact.email || "").trim();
     const fullName = (subscriber.name || contact.name || "Assinante (sem nome)").trim();
-    const phone = (subscriber.phone_number || contact.phone_number || "").trim();
+
+    // Normalização de telefone → E.164 (usa phone_local_code como DDI quando houver)
+    const phoneRaw = (subscriber.phone_number || contact.phone_number || "").trim();
+    const country  = (subscriber.phone_local_code || contact.phone_local_code || "55").replace(/\D+/g, "") || "55";
+    const phone    = toE164(phoneRaw, country); // se inválido → null (será omitido no Klaviyo)
 
     const subscriptionCode = sub.subscription_code || sub.id || sub.internal_id || "";
     const planName   = sub.product?.name || sub.next_product?.name || sub.last_transaction?.product?.name || "Plano";
@@ -224,7 +246,7 @@ export default async function handler(req, res) {
           owner_id: PERSON_OWNER_ID ? Number(PERSON_OWNER_ID) : undefined,
           visible_to: 3,
           email: email ? [{ value: email, primary: true }] : undefined,
-          phone: phone ? [{ value: phone, primary: true }] : undefined
+          phone: phoneRaw ? [{ value: phoneRaw, primary: true }] : undefined // mantém no Pipedrive como foi recebido
         })
       });
       personId = created.json?.data?.id;
@@ -232,7 +254,8 @@ export default async function handler(req, res) {
     }
 
     // —— Criar DEAL (sempre no estágio de onboarding)
-    const title = normPhone(phone) ? `(${normPhone(phone)}) (${planName})` : `${planName} – ${fullName}`;
+    const phoneDigits = normPhoneDigits(phoneRaw);
+    const title = phoneDigits ? `(${phoneDigits}) (${planName})` : `${planName} – ${fullName}`;
     const payloadDeal = {
       title,
       person_id: personId,
