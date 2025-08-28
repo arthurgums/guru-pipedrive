@@ -2,9 +2,8 @@
 // Guru (Digital Manager) → Pipedrive + Klaviyo (Vercel, Node 20)
 // - Só CRIA deals no estágio de Onboarding (nunca atualiza/move)
 // - Idempotência por subscription_code (se já existir, não cria de novo)
-// - expected_close_date = period_end | hoje+30
+// - expected_close_date = (period_end | cycle_end_date) + 1 dia  |  fallback: mesmo dia do mês seguinte baseado no início do ciclo
 // - Klaviyo: subscribe em “novos”, unsubscribe em cancelamento (Pipedrive permanece igual)
-// - Normalização de telefone para E.164 (se inválido, omite do payload do Klaviyo)
 
 const {
   PIPEDRIVE_DOMAIN,
@@ -35,8 +34,7 @@ async function pdr(path, opts = {}) {
   return { status: res.status, json };
 }
 const norm = s => (s || "").normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase();
-const normPhoneDigits = p => (p || "").replace(/\D+/g, "");
-
+const normPhone = p => (p || "").replace(/\D+/g, "");
 async function readRaw(req) {
   const chunks = [];
   for await (const c of req) chunks.push(typeof c === "string" ? Buffer.from(c) : c);
@@ -48,28 +46,32 @@ async function readJsonFromReq(req) {
   const raw = (await readRaw(req)).trim();
   return raw ? JSON.parse(raw) : {};
 }
-function addDaysUTC(date, days) {
-  const d = new Date(date.getTime());
-  d.setUTCDate(d.getUTCDate() + days);
-  return d;
-}
 function ymdUTC(d) {
   return d.toISOString().slice(0, 10); // "YYYY-MM-DD"
 }
 
-// Normaliza telefone para E.164. Se inválido → retorna null (para omitir no Klaviyo)
-function toE164(phone, countryCode = "55") {
-  const digits = normPhoneDigits(phone);
-  if (!digits) return null;
-
-  // Se 'digits' já começar com o DDI (ex.: "55..."), mantém; senão prefixa
-  const cc = String(countryCode || "").replace(/\D+/g, "") || "55";
-  const needsCC = !digits.startsWith(cc);
-  const full = (needsCC ? cc : "") + digits;
-
-  const e164 = `+${full}`;
-  // Validação básica E.164: + e 8–15 dígitos
-  return /^\+[1-9]\d{7,14}$/.test(e164) ? e164 : null;
+// Mesmo dia do mês seguinte (se não existir, usa o último dia do mês)
+function sameDayNextMonthUTC(date) {
+  const y = date.getUTCFullYear();
+  const m = date.getUTCMonth(); // 0-11
+  const d = date.getUTCDate();
+  const firstNext = new Date(Date.UTC(y, m + 1, 1));
+  const daysInNext = new Date(Date.UTC(firstNext.getUTCFullYear(), firstNext.getUTCMonth() + 1, 0)).getUTCDate();
+  const day = Math.min(d, daysInNext);
+  return new Date(Date.UTC(firstNext.getUTCFullYear(), firstNext.getUTCMonth(), day));
+}
+function parseDateUTC(s) {
+  if (!s) return null;
+  const t = String(s).trim();
+  if (!t) return null;
+  const iso = /^\d{4}-\d{2}-\d{2}$/.test(t) ? `${t}T00:00:00Z` : t;
+  const d = new Date(iso);
+  return isNaN(d) ? null : d;
+}
+function addDaysUTC(date, days) {
+  const d = new Date(Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate()));
+  d.setUTCDate(d.getUTCDate() + days);
+  return d;
 }
 
 // Status que PODEM criar deal (pt/en)
@@ -99,7 +101,7 @@ async function klFetch(url, payload) {
 
 // Assina email (e opcionalmente telefone) na lista
 async function klaviyoSubscribe({ email, phone }) {
-  if (!hasKlaviyoEnv() || !email) return { skipped: true };
+  if (!hasKlaviyoEnv() || !email) return { attempted: false, ok: false, reason: !hasKlaviyoEnv() ? "missing-klaviyo-config" : "missing-email" };
   const payload = {
     data: {
       type: "profile-subscription-bulk-create-job",
@@ -113,7 +115,6 @@ async function klaviyoSubscribe({ email, phone }) {
                 ...(phone ? { phone_number: phone } : {}),
                 subscriptions: {
                   email: { marketing: { consent: "SUBSCRIBED" } }
-                  // Se quiser SMS também: sms: { marketing: { consent: "SUBSCRIBED" } }
                 }
               }
             }
@@ -125,12 +126,13 @@ async function klaviyoSubscribe({ email, phone }) {
       }
     }
   };
-  return klFetch("https://a.klaviyo.com/api/profile-subscription-bulk-create-jobs/", payload);
+  const r = await klFetch("https://a.klaviyo.com/api/profile-subscription-bulk-create-jobs/", payload);
+  return { attempted: true, ok: r.ok, status: r.status, body: r.body };
 }
 
 // Cancela assinatura de email na lista (sem tocar no Pipedrive)
 async function klaviyoUnsubscribe({ email }) {
-  if (!hasKlaviyoEnv() || !email) return { skipped: true };
+  if (!hasKlaviyoEnv() || !email) return { attempted: false, ok: false, reason: !hasKlaviyoEnv() ? "missing-klaviyo-config" : "missing-email" };
   const payload = {
     data: {
       type: "profile-subscription-bulk-delete-job",
@@ -154,7 +156,8 @@ async function klaviyoUnsubscribe({ email }) {
       }
     }
   };
-  return klFetch("https://a.klaviyo.com/api/profile-subscription-bulk-delete-jobs/", payload);
+  const r = await klFetch("https://a.klaviyo.com/api/profile-subscription-bulk-delete-jobs/", payload);
+  return { attempted: true, ok: r.ok, status: r.status, body: r.body };
 }
 
 // ----------------- handler -----------------
@@ -178,14 +181,9 @@ export default async function handler(req, res) {
     // ----- map mínimo do payload -----
     const contact    = sub.last_transaction?.contact || {};
     const subscriber = sub.subscriber || {};
-
-    const email = (subscriber.email || contact.email || "").trim();
-    const fullName = (subscriber.name || contact.name || "Assinante (sem nome)").trim();
-
-    // Normalização de telefone → E.164 (usa phone_local_code como DDI quando houver)
-    const phoneRaw = (subscriber.phone_number || contact.phone_number || "").trim();
-    const country  = (subscriber.phone_local_code || contact.phone_local_code || "55").replace(/\D+/g, "") || "55";
-    const phone    = toE164(phoneRaw, country); // se inválido → null (será omitido no Klaviyo)
+    const email      = (subscriber.email || contact.email || "").trim();
+    const fullName   = (subscriber.name || contact.name || "Assinante (sem nome)").trim();
+    const phone      = (subscriber.phone_number || contact.phone_number || "").trim();
 
     const subscriptionCode = sub.subscription_code || sub.id || sub.internal_id || "";
     const planName   = sub.product?.name || sub.next_product?.name || sub.last_transaction?.product?.name || "Plano";
@@ -193,97 +191,169 @@ export default async function handler(req, res) {
     const lastStatus = sub.last_status || "unknown";
     const ls         = norm(lastStatus);
 
-    // expected_close_date = period_end | cycle_end_date | hoje+30
-    const expectedCloseRaw =
+    // ciclo atual (para só criar no ciclo 1)
+    const cycle = Number(sub.current_invoice?.cycle ?? sub.last_transaction?.invoice?.cycle ?? 0);
+    const isFirstCycle = cycle === 1;
+
+    // CANCELAMENTO (não mexe no Pipedrive)
+    const cancelish =
+      ["cancelada","cancelado","cancelled","canceled"].includes(ls) ||
+      String(sub.cancel_at_cycle_end || "") === "1" ||
+      Boolean(sub.dates?.canceled_at) ||
+      Boolean((sub.cancel_reason || "").trim());
+
+    // expected_close_date = (period_end | cycle_end_date) + 1 dia  |  fallback: mesmo dia do mês seguinte baseado no início do ciclo
+    const periodEndRaw =
       sub?.current_invoice?.period_end ||
       sub?.last_transaction?.invoice?.period_end ||
       sub?.dates?.cycle_end_date ||
       null;
 
-    const expectedClose = expectedCloseRaw && String(expectedCloseRaw).trim()
-      ? String(expectedCloseRaw).trim()
-      : ymdUTC(addDaysUTC(new Date(), 30));
+    const baseStartDate =
+      parseDateUTC(sub?.current_invoice?.period_start) ||
+      parseDateUTC(sub?.dates?.cycle_start_date) ||
+      parseDateUTC(sub?.current_invoice?.charge_at) ||
+      parseDateUTC(sub?.last_transaction?.invoice?.period_start) ||
+      new Date();
 
-    // —— Cancelamento: remove do Klaviyo e sai (não mexe no Pipedrive)
-    if (["cancelada","cancelado","cancelled","canceled"].includes(ls)) {
-      const kl = await klaviyoUnsubscribe({ email });
-      return res.status(200).json({ ok: true, skipped: true, reason: "cancel-received", klaviyo: kl });
-    }
+    const periodEndDate = parseDateUTC(periodEndRaw);
+    const expectedCloseDate = periodEndDate ? addDaysUTC(periodEndDate, 1) : sameDayNextMonthUTC(baseStartDate);
+    const expectedClose = ymdUTC(expectedCloseDate);
 
-    // —— “Novos” (status permitidos): assina no Klaviyo (se tiver email)
-    let klaviyo = {};
-    if (email && ALLOW_CREATE.includes(ls)) {
-      try { klaviyo = await klaviyoSubscribe({ email, phone }); }
-      catch (e) { klaviyo = { ok: false, error: e.message }; }
-    }
-
-    // —— Idempotência por subscription_code → se já existir, NÃO cria deal
-    if (DEAL_FIELD_SUBSCRIPTION && subscriptionCode) {
-      const srch = await pdr(`/api/v2/deals/search?term=${encodeURIComponent(subscriptionCode)}&fields=custom_fields&exact_match=1`, { method: "GET" });
-      const existingId = srch.json?.data?.items?.[0]?.item?.id || null;
-      if (existingId) {
-        return res.status(200).json({ ok: true, skipped: true, reason: "already-exists", dealId: existingId, klaviyo });
+    // ---------- resultado unificado ----------
+    const out = {
+      ok: true,
+      meta: {
+        status: lastStatus,
+        cycle,
+        subscription_code: subscriptionCode || null,
+        email: email || null,
+        plan: planName,
+        expected_close_date: expectedClose
+      },
+      klaviyo: {
+        attempted: false,
+        action: null,
+        ok: false,
+        reason: null,
+        status: null
+      },
+      pipedrive: {
+        attempted: false,
+        action: null,
+        ok: false,
+        reason: null,
+        dealId: null,
+        personId: null
       }
-    }
-
-    // —— Só cria para status “novos”
-    if (!ALLOW_CREATE.includes(ls)) {
-      return res.status(200).json({ ok: true, skipped: true, reason: "status-not-allowed", lastStatus, klaviyo });
-    }
-
-    // —— Upsert da PESSOA (cria se não existir por email)
-    let personId = null;
-    if (email) {
-      const psearch = await pdr(`/api/v2/persons/search?term=${encodeURIComponent(email)}&fields=email&exact_match=1`, { method: "GET" });
-      personId = psearch.json?.data?.items?.[0]?.item?.id || null;
-    }
-    if (!personId) {
-      const created = await pdr(`/api/v1/persons`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          name: fullName,
-          owner_id: PERSON_OWNER_ID ? Number(PERSON_OWNER_ID) : undefined,
-          visible_to: 3,
-          email: email ? [{ value: email, primary: true }] : undefined,
-          phone: phoneRaw ? [{ value: phoneRaw, primary: true }] : undefined // mantém no Pipedrive como foi recebido
-        })
-      });
-      personId = created.json?.data?.id;
-      if (!personId) throw new Error("Falha ao criar pessoa");
-    }
-
-    // —— Criar DEAL (sempre no estágio de onboarding)
-    const phoneDigits = normPhoneDigits(phoneRaw);
-    const title = phoneDigits ? `(${phoneDigits}) (${planName})` : `${planName} – ${fullName}`;
-    const payloadDeal = {
-      title,
-      person_id: personId,
-      pipeline_id: Number(PIPELINE_ID),
-      stage_id: Number(STAGE_ID_ONBOARD),
-      value: mrr,
-      currency: "BRL",
-      owner_id: DEAL_OWNER_ID ? Number(DEAL_OWNER_ID) : undefined,
-      status: "open",
-      expected_close_date: expectedClose,
-      ...(DEAL_FIELD_SUBSCRIPTION && subscriptionCode ? { [DEAL_FIELD_SUBSCRIPTION]: subscriptionCode } : {})
     };
 
-    const createdDeal = await pdr(`/api/v1/deals`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(payloadDeal)
-    });
+    // ---------- KLAVIYO ----------
+    try {
+      if (cancelish) {
+        out.klaviyo.action = "unsubscribe";
+        const r = await klaviyoUnsubscribe({ email });
+        Object.assign(out.klaviyo, r);
+      } else if (ALLOW_CREATE.includes(ls)) {
+        out.klaviyo.action = "subscribe";
+        const r = await klaviyoSubscribe({ email, phone });
+        Object.assign(out.klaviyo, r);
+      } else {
+        out.klaviyo.action = "none";
+        out.klaviyo.reason = "status-not-allowed";
+      }
+    } catch (e) {
+      out.klaviyo.attempted = true;
+      out.klaviyo.ok = false;
+      out.klaviyo.action = out.klaviyo.action || "subscribe";
+      out.klaviyo.reason = e.message || "klaviyo-error";
+    }
 
-    return res.status(200).json({
-      ok: true,
-      personId,
-      dealId: createdDeal.json?.data?.id || null,
-      status: lastStatus,
-      mrr,
-      expected_close_date: expectedClose,
-      klaviyo
-    });
+    // ---------- PIPEDRIVE ----------
+    try {
+      if (cancelish) {
+        out.pipedrive.action = "none";
+        out.pipedrive.reason = "cancellation-event";
+      } else if (!subscriptionCode) {
+        out.pipedrive.action = "none";
+        out.pipedrive.reason = "missing-subscription-code";
+      } else if (!ALLOW_CREATE.includes(ls)) {
+        out.pipedrive.action = "none";
+        out.pipedrive.reason = "status-not-allowed";
+      } else if (!isFirstCycle) {
+        out.pipedrive.action = "none";
+        out.pipedrive.reason = "not-first-cycle";
+      } else {
+        // Idempotência
+        if (DEAL_FIELD_SUBSCRIPTION) {
+          const srch = await pdr(`/api/v2/deals/search?term=${encodeURIComponent(subscriptionCode)}&fields=custom_fields&exact_match=1`, { method: "GET" });
+          const existingId = srch.json?.data?.items?.[0]?.item?.id || null;
+          if (existingId) {
+            out.pipedrive.action = "none";
+            out.pipedrive.reason = "already-exists";
+            out.pipedrive.dealId = existingId;
+          } else {
+            // Upsert da pessoa por email
+            let personId = null;
+            if (email) {
+              const psearch = await pdr(`/api/v2/persons/search?term=${encodeURIComponent(email)}&fields=email&exact_match=1`, { method: "GET" });
+              personId = psearch.json?.data?.items?.[0]?.item?.id || null;
+            }
+            if (!personId) {
+              const created = await pdr(`/api/v1/persons`, {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({
+                  name: fullName,
+                  owner_id: PERSON_OWNER_ID ? Number(PERSON_OWNER_ID) : undefined,
+                  visible_to: 3,
+                  email: email ? [{ value: email, primary: true }] : undefined,
+                  phone: phone ? [{ value: phone, primary: true }] : undefined
+                })
+              });
+              personId = created.json?.data?.id;
+              if (!personId) throw new Error("person-create-failed");
+            }
+
+            const title = normPhone(phone) ? `(${normPhone(phone)}) (${planName})` : `${planName} – ${fullName}`;
+            const payloadDeal = {
+              title,
+              person_id: personId,
+              pipeline_id: Number(PIPELINE_ID),
+              stage_id: Number(STAGE_ID_ONBOARD),
+              value: mrr,
+              currency: "BRL",
+              owner_id: DEAL_OWNER_ID ? Number(DEAL_OWNER_ID) : undefined,
+              status: "open",
+              expected_close_date: expectedClose,
+              ...(DEAL_FIELD_SUBSCRIPTION ? { [DEAL_FIELD_SUBSCRIPTION]: subscriptionCode } : {})
+            };
+
+            const createdDeal = await pdr(`/api/v1/deals`, {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify(payloadDeal)
+            });
+
+            out.pipedrive.attempted = true;
+            out.pipedrive.action = "create-deal";
+            out.pipedrive.ok = true;
+            out.pipedrive.personId = personId;
+            out.pipedrive.dealId = createdDeal.json?.data?.id || null;
+          }
+        } else {
+          out.pipedrive.action = "none";
+          out.pipedrive.reason = "missing-deal-field-subscription";
+        }
+      }
+    } catch (e) {
+      out.pipedrive.attempted = true;
+      out.pipedrive.ok = false;
+      out.pipedrive.action = out.pipedrive.action || "create-deal";
+      out.pipedrive.reason = e.message || "pipedrive-error";
+    }
+
+    return res.status(200).json(out);
   } catch (e) {
     console.error(e);
     return res.status(500).json({ ok: false, error: e.message });
